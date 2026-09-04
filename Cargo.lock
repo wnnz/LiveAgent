@@ -3465,6 +3465,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-cron-scheduler",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-tungstenite 0.29.0",
  "toml 0.9.12+spec-1.1.0",
@@ -3472,6 +3473,7 @@ dependencies = [
  "uuid",
  "wait-timeout",
  "walkdir",
+ "webpki-roots 0.26.11",
  "windows-sys 0.61.2",
  "zip 8.6.0",
  "zstd",
@@ -5566,6 +5568,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",

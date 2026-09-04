@@ -3,21 +3,27 @@
 //! 本模块刻意不依赖 tauri，
 //! 便于纯 tokio 测试；业务信封收发主循环由 connection.rs / terminal.rs 驱动。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use reqwest::Url;
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, Request as HttpRequest};
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{client_async, connect_async, MaybeTlsStream, WebSocketStream};
 
 use super::ensure_rustls_crypto_provider;
 use super::gateway_proto::v2;
+use crate::runtime::terminal::{
+    http_connect_proxy, socks5_connect_proxy, system_proxy_to_ssh_proxy, SshProxyKind,
+};
+use crate::services::system_proxy::{self, SystemProxyConfig};
 
 /// v2 WebSocket 子协议名（与 Go 侧 `pbws.Subprotocol` 一致；服务端必须回显）。
 pub(crate) const GATEWAY_WS_SUBPROTOCOL: &str = "liveagent.v2.pb";
@@ -199,6 +205,8 @@ async fn connect_and_hello(
 }
 
 /// 以 v2 子协议发起 WS 升级并校验服务端回显（旧网关兜底路由可能接受升级却不认识 v2 帧）。
+/// 底层建连遵循应用代理设置（`system_proxy` 单一真源）：未启用或目标命中环回豁免时
+/// 直连；启用但配置无效时 fail fast；其余经 HTTP CONNECT / SOCKS5 隧道到达网关。
 async fn connect_ws(url: &str) -> Result<WsStream, String> {
     if url.starts_with("wss://") {
         // rustls 连接器复用进程级默认 crypto provider（ensure_rustls_crypto_provider 负责唯一一次 ring 安装）。
@@ -211,10 +219,15 @@ async fn connect_ws(url: &str) -> Result<WsStream, String> {
         SEC_WEBSOCKET_PROTOCOL,
         HeaderValue::from_static(GATEWAY_WS_SUBPROTOCOL),
     );
-    let (stream, response) = connect_async(request)
-        .await
-        .map_err(|error| format!("gateway v2 connect failed: {error}"))?;
-    let echoed = response
+    // 直连分支保持与上游一致的 connect_async 行为，便于后续合并；
+    // 代理分支在应用代理隧道上复用同一套 WS 握手与子协议校验。
+    let proxy = resolve_gateway_app_proxy(&request)?;
+    let (stream, response) = match proxy {
+        None => connect_async(request)
+            .await
+            .map_err(|error| format!("gateway v2 connect failed: {error}"))?,
+        Some(config) => connect_ws_via_proxy(request, config).await?,
+    };    let echoed = response
         .headers()
         .get(SEC_WEBSOCKET_PROTOCOL)
         .and_then(|value| value.to_str().ok())
@@ -225,6 +238,107 @@ async fn connect_ws(url: &str) -> Result<WsStream, String> {
         ));
     }
     Ok(stream)
+}
+
+/// 解析网关 WS 建连应复用的应用代理。`Ok(None)` 表示直连：应用代理未启用，
+/// 或目标命中环回豁免（与 `system_proxy` 对 reqwest 出网点生效的 NO_PROXY_DEFAULT
+/// 语义一致，环回网关不应被送进代理）。启用但配置无效时返回 `Err`，调用方
+/// fail fast 而不是静默降级为直连，与 SSH 链路的处理一致。
+fn resolve_gateway_app_proxy(request: &HttpRequest<()>) -> Result<Option<SystemProxyConfig>, String> {
+    let Some(config) = system_proxy::current_config()
+        .map_err(|error| format!("gateway v2 cannot reuse the app proxy: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let host = request.uri().host().unwrap_or_default();
+    if ws_host_bypasses_app_proxy(host) {
+        return Ok(None);
+    }
+    Ok(Some(config))
+}
+
+/// 环回目标豁免判定：字面值与 `system_proxy` 的 NO_PROXY_DEFAULT
+/// （localhost,127.0.0.1,::1）对齐，额外覆盖 127.0.0.0/8 网段与带方括号的 IPv6 写法。
+fn ws_host_bypasses_app_proxy(host: &str) -> bool {
+    let trimmed = host.trim();
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // 同时覆盖裸 IPv4/IPv6 与带方括号的 IPv6（WS URL 的 host 部分带括号）。
+    trimmed
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// 经应用代理建立网关 WS 底层流并完成 WS 握手：TCP 连代理 → HTTP CONNECT /
+/// SOCKS5 打通到目标网关的隧道 →（wss 时）在隧道之上手动 TLS 握手 → 复用
+/// `client_async` 在同一条流上做 WS 升级，返回流与升级响应（供子协议校验）。
+async fn connect_ws_via_proxy(
+    request: HttpRequest<()>,
+    config: SystemProxyConfig,
+) -> Result<(WsStream, tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>), String> {
+    let uri = request.uri().clone();
+    let target_host = uri
+        .host()
+        .filter(|host| !host.is_empty())
+        .ok_or("gateway v2 request is missing target host")?
+        .to_string();
+    let target_port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+        Some("https") | Some("wss") => 443,
+        _ => 80,
+    });
+    let proxy = system_proxy_to_ssh_proxy(&config);
+    let mut tunnel = TcpStream::connect((proxy.host.as_str(), proxy.port))
+        .await
+        .map_err(|error| {
+            format!(
+                "gateway v2 app proxy connection to {}:{} failed: {error}",
+                proxy.host, proxy.port
+            )
+        })?;
+    // 代理握手实现与 SSH 链路完全一致（http_connect_proxy / socks5_connect_proxy），
+    // 仅错误消息前缀改为 gateway 语境，便于区分链路来源。
+    let tunnel_result = match proxy.kind {
+        SshProxyKind::Http => {
+            http_connect_proxy(&mut tunnel, &target_host, target_port, &proxy).await
+        }
+        SshProxyKind::Socks5 => {
+            socks5_connect_proxy(&mut tunnel, &target_host, target_port, &proxy).await
+        }
+    };
+    tunnel_result.map_err(|error| format!("gateway v2 app proxy tunnel failed: {error}"))?;
+    let stream = if uri.scheme_str() == Some("wss") || uri.scheme_str() == Some("https") {
+        // tokio-tungstenite 的 connect_async 不支持在既有流上建 TLS，
+        // 这里在代理隧道之上手动完成 TLS；证书源与 connect_async 一致（webpki roots）。
+        let connector = gateway_ws_tls_connector()?;
+        let server_name = rustls::pki_types::ServerName::try_from(target_host.clone())
+            .map_err(|error| format!("gateway v2 tls server name invalid: {error}"))?;
+        let tls = connector
+            .connect(server_name, tunnel)
+            .await
+            .map_err(|error| format!("gateway v2 tls handshake failed: {error}"))?;
+        MaybeTlsStream::Rustls(tls)
+    } else {
+        MaybeTlsStream::Plain(tunnel)
+    };
+    let (stream, response) = client_async(request, stream)
+        .await
+        .map_err(|error| format!("gateway v2 connect failed: {error}"))?;
+    Ok((stream, response))
+}
+
+/// 构建网关 WS 使用的 rustls TLS 连接器：信任源与 `connect_async`
+/// （rustls-tls-webpki-roots feature）保持一致，使用 webpki roots。
+/// 前置条件：`ensure_rustls_crypto_provider()` 已安装进程级默认 crypto provider。
+fn gateway_ws_tls_connector() -> Result<TlsConnector, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
 }
 
 /// 等待 ServerHello；hello 前容忍 Ping/Pong 控制帧，其余帧按协议错误（hello 必为首帧）。
@@ -573,5 +687,52 @@ mod tests {
         }
 
         server.await.expect("server task");
+    }
+
+    #[test]
+    fn loopback_hosts_bypass_app_proxy() {
+        // 与 system_proxy 的 NO_PROXY_DEFAULT 字面值保持一致语义。
+        for host in ["localhost", "LOCALHOST", "127.0.0.1", "127.8.8.8", "::1", "[::1]"] {
+            assert!(ws_host_bypasses_app_proxy(host), "{host} must bypass");
+        }
+        for host in ["gateway.example.com", "192.168.1.1", "10.0.0.1"] {
+            assert!(!ws_host_bypasses_app_proxy(host), "{host} must not bypass");
+        }
+    }
+
+    /// 真实网关 + 应用代理联通性验证（默认忽略，仅手动验证时运行）：
+    /// - `LIVEAGENT_GATEWAY_TEST_URL`：网关基址（如 https://gateway.example.com）
+    /// - `LIVEAGENT_GATEWAY_TEST_TOKEN`：网关令牌（必填，避免令牌入库）
+    /// - `LIVEAGENT_GATEWAY_TEST_AGENT_ID`：可选，缺省 probe-agent
+    /// - `LIVEAGENT_GATEWAY_TEST_PROXY`：可选，应用代理配置 JSON
+    ///   （如 {"enabled":true,"type":"http","host":"192.168.125.75","port":10808}）
+    #[tokio::test]
+    #[ignore = "需要真实网关地址与令牌，通过环境变量提供"]
+    async fn live_gateway_app_proxy_connect() {
+        let url = std::env::var("LIVEAGENT_GATEWAY_TEST_URL").expect("set LIVEAGENT_GATEWAY_TEST_URL");
+        let token = std::env::var("LIVEAGENT_GATEWAY_TEST_TOKEN").expect("set LIVEAGENT_GATEWAY_TEST_TOKEN");
+        let agent_id = std::env::var("LIVEAGENT_GATEWAY_TEST_AGENT_ID")
+            .unwrap_or_else(|_| "probe-agent".to_string());
+        if let Ok(raw) = std::env::var("LIVEAGENT_GATEWAY_TEST_PROXY") {
+            let value: serde_json::Value = serde_json::from_str(&raw).expect("parse proxy json");
+            system_proxy::set_config(Some(&value));
+        }
+
+        let port: u16 = std::env::var("LIVEAGENT_GATEWAY_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(0);
+        let ws_url = build_ws_url(&url, port, GATEWAY_WS_AGENT_PATH).expect("build ws url");
+        let (stream, hello) = connect_agent_ws(
+            &ws_url,
+            build_client_hello(&token, agent_id, "0.0.0".to_string()),
+        )
+        .await
+        .expect("gateway v2 handshake through app proxy");
+        assert!(hello.ok, "gateway must accept the probe hello");
+
+        // 探测完立即丢弃流退出，不进入业务信封收发主循环。
+        drop(stream);
+        system_proxy::set_config(None);
     }
 }
