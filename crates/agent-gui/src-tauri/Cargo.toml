@@ -34,10 +34,11 @@ axum = "0.8.9"
 tokio = { version = "1.52.3", features = ["macros", "net", "sync", "time", "io-util"] }
 tokio-stream = "0.1.18"
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
-# 网关 v2 WS 建连复用应用代理（system_proxy）时，需在代理隧道之上手动完成 TLS；
-# 两个依赖与 tokio-tungstenite 0.29 内置 TLS 栈同源同版本，不引入额外编译产物。
+# 网关 v2 WS 建连复用应用代理（system_proxy）时，需在代理隧道之上手动完成 TLS：
+# tokio-rustls 与 tokio-tungstenite 0.29 内置 TLS 栈同源同版本；证书验证使用
+# rustls-platform-verifier（平台系统证书库），以覆盖企业 SSL Inspection 代理场景。
 tokio-rustls = "0.26"
-webpki-roots = "0.26"
+rustls-platform-verifier = "0.7"
 futures-util = "0.3.32"
 async-trait = "0.1.89"
 hmac = "0.12.1"

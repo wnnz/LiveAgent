@@ -11,6 +11,7 @@ use prost::Message as ProstMessage;
 use reqwest::Url;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use rustls_platform_verifier::ConfigVerifierExt;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, Request as HttpRequest};
@@ -329,15 +330,15 @@ async fn connect_ws_via_proxy(
     Ok((stream, response))
 }
 
-/// 构建网关 WS 使用的 rustls TLS 连接器：信任源与 `connect_async`
-/// （rustls-tls-webpki-roots feature）保持一致，使用 webpki roots。
-/// 前置条件：`ensure_rustls_crypto_provider()` 已安装进程级默认 crypto provider。
+/// 构建网关 WS 使用的 rustls TLS 连接器：证书验证走平台系统证书库
+/// （`rustls-platform-verifier`，Windows 证书存储），与应用内 reqwest 出网点一致。
+/// 企业环境经 SSL Inspection 代理（如 Zscaler）访问网关时，重签证书的企业根
+/// 已装入系统信任库，可正常通过验证；webpki 静态公共根无法覆盖该场景。
+/// 前置条件：`ensure_rustls_crypto_provider()` 已安装进程级默认 crypto provider；
+/// 须在 tokio 运行时上下文中调用（平台 verifier 构造会读取当前 runtime）。
 fn gateway_ws_tls_connector() -> Result<TlsConnector, String> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let config = rustls::ClientConfig::with_platform_verifier()
+        .map_err(|error| format!("gateway v2 tls platform verifier init failed: {error}"))?;
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
